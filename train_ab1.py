@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from datasets.ab1_dataset import AB1PairDataset, collate_ab1_batch, discover_pairs
 from nets.unet_1d import UNet1D
-from nets.unet_resnet_1d import ResNet50UNet1D
+from nets.unet_resnet_1d import ResNet50UNet1D, ResNet101UNet1D
 
 
 def build_model(backbone: str, input_channels: int = 9):
@@ -18,6 +18,8 @@ def build_model(backbone: str, input_channels: int = 9):
         return UNet1D(input_channels=input_channels, base_channels=32)
     if backbone == "resnet50":
         return ResNet50UNet1D(input_channels=input_channels)
+    if backbone == "resnet101":
+        return ResNet101UNet1D(input_channels=input_channels)
     raise ValueError(f"Unsupported backbone: {backbone}")
 
 
@@ -184,9 +186,9 @@ def main():
     parser.add_argument("--min-query-coverage", type=float, default=0.80)
     parser.add_argument(
         "--backbone",
-        choices=["plain", "resnet50"],
+        choices=["plain", "resnet50", "resnet101"],
         default="plain",
-        help="plain = original 1D U-Net, resnet50 = 1D ResNet50 encoder + U-Net decoder.",
+        help="plain = original 1D U-Net, resnet50/resnet101 = 1D ResNet encoder + U-Net decoder.",
     )
     parser.add_argument(
         "--boundary-radius",
