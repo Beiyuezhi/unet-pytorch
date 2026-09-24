@@ -232,3 +232,39 @@ python train_ab1.py \
 ```
 
 checkpoint 会保存 `backbone` 字段，`predict_ab1.py` 会自动选择正确的网络结构。
+
+
+## 1D ResNet101 U-Net 对比实验
+
+ResNet101 已支持，encoder stage 深度为：
+
+```text
+[3, 4, 23, 3]
+```
+
+与 ResNet50 的 `[3, 4, 6, 3]` 相比，主要是第三个 stage 从 6 个 bottleneck 增加到 23 个。
+
+训练命令：
+
+```powershell
+python train_ab1.py \
+  --raw-dir data/raw \
+  --trimmed-dir data/trimmed \
+  --output-dir logs_ab1_resnet101 \
+  --epochs 100 \
+  --batch-size 8 \
+  --device cpu \
+  --backbone resnet101
+```
+
+如果 CPU 内存或速度压力较大，可把 batch size 改为 4 或 2。
+
+当前可选 backbone：
+
+```text
+plain
+resnet50
+resnet101
+```
+
+checkpoint 会保存 backbone，`predict_ab1.py` 会自动恢复对应的 1D U-Net 结构。
