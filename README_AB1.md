@@ -155,3 +155,41 @@ train_ab1.py
 predict_ab1.py
 requirements_ab1.txt
 ```
+
+
+## 边界优化版训练
+
+当前训练脚本默认对真实裁剪起点和终点附近进行额外 BCE 加权：
+
+- `--boundary-radius 12`：start/end 两侧各 12 bp
+- `--boundary-weight 4.0`：边界区域 BCE 权重为普通位置的 4 倍
+- Dice loss 仍然保留
+- 默认 loss：`0.5 * boundary-weighted BCE + 0.5 * Dice`
+
+同时增加 early stopping，默认连续 12 个 epoch 的 `boundary_mae` 没有至少 0.05 bp 改善就停止。
+
+推荐 CPU 训练命令：
+
+```powershell
+python train_ab1.py \
+  --raw-dir data/raw \
+  --trimmed-dir data/trimmed \
+  --output-dir logs_ab1_boundary \
+  --epochs 100 \
+  --batch-size 8 \
+  --device cpu
+```
+
+新增验证指标：
+
+- `boundary_mae`：start/end MAE 的平均
+- `start_bias` / `end_bias`：有符号偏差；正数表示预测位置偏后，负数表示偏前
+- `start_within_5bp/10bp/20bp`
+- `end_within_5bp/10bp/20bp`
+
+权重文件：
+
+- `best.pth`：按最低 boundary MAE 保存
+- `best_boundary.pth`：与 best.pth 相同，明确表示边界最佳
+- `best_iou.pth`：按最高 interval IoU 保存
+- `last.pth`：最后一个 epoch
