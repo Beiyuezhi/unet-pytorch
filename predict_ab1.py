@@ -3,8 +3,23 @@ import argparse
 import torch
 
 from nets.unet_1d import UNet1D
+from nets.unet_resnet_1d import ResNet50UNet1D
 from train_ab1 import interval_from_probs
 from utils.ab1_features import load_ab1_base_features
+
+
+def build_model_from_checkpoint(checkpoint):
+    backbone = checkpoint.get("backbone", "plain")
+    input_channels = checkpoint.get("input_channels", 9)
+
+    if backbone == "resnet50":
+        model = ResNet50UNet1D(input_channels=input_channels)
+    else:
+        model = UNet1D(
+            input_channels=input_channels,
+            base_channels=checkpoint.get("base_channels", 32) or 32,
+        )
+    return model, backbone
 
 
 def main():
@@ -12,15 +27,25 @@ def main():
     parser.add_argument("--ab1", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+    )
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(args.model, map_location=device)
+    if args.device == "cpu":
+        device = torch.device("cpu")
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested, but CUDA is not available.")
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = UNet1D(
-        input_channels=checkpoint.get("input_channels", 9),
-        base_channels=checkpoint.get("base_channels", 32),
-    ).to(device)
+    checkpoint = torch.load(args.model, map_location=device)
+    model, backbone = build_model_from_checkpoint(checkpoint)
+    model = model.to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -32,6 +57,7 @@ def main():
 
     start, end = interval_from_probs(probs, args.threshold)
 
+    print(f"backbone={backbone}")
     print(f"bases={len(sequence)}")
     print(f"start={start}")
     print(f"end={end}")
