@@ -1,0 +1,3 @@
+torch
+numpy
+biopython>=1.83
