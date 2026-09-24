@@ -1,3 +1,4 @@
 torch
 numpy
 biopython>=1.83
+tqdm>=4.60
