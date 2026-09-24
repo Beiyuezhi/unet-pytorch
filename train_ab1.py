@@ -12,10 +12,38 @@ from datasets.ab1_dataset import AB1PairDataset, collate_ab1_batch, discover_pai
 from nets.unet_1d import UNet1D
 
 
-def masked_bce_with_logits(logits, targets, valid_mask):
-    loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    loss = loss * valid_mask
-    return loss.sum() / valid_mask.sum().clamp_min(1.0)
+def boundary_weighted_bce_with_logits(
+    logits,
+    targets,
+    valid_mask,
+    starts,
+    ends,
+    boundary_radius=12,
+    boundary_weight=4.0,
+):
+    """
+    BCE over the full sequence, with extra weight around the true trim boundaries.
+
+    start is inclusive and end is exclusive. Positions within +/- boundary_radius
+    bases of either boundary receive boundary_weight times the normal BCE weight.
+    """
+    per_position = F.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none"
+    )
+
+    batch_size, length = logits.shape
+    positions = torch.arange(length, device=logits.device).unsqueeze(0)
+    starts = starts.to(logits.device).view(batch_size, 1)
+    ends = ends.to(logits.device).view(batch_size, 1)
+
+    near_start = (positions - starts).abs() <= boundary_radius
+    near_end = (positions - ends).abs() <= boundary_radius
+    boundary = (near_start | near_end).float()
+
+    weights = 1.0 + (boundary_weight - 1.0) * boundary
+    weights = weights * valid_mask
+
+    return (per_position * weights).sum() / weights.sum().clamp_min(1.0)
 
 
 def masked_dice_loss(logits, targets, valid_mask, eps=1e-6):
@@ -47,12 +75,24 @@ def interval_from_probs(probs, threshold=0.5):
     return best[0], best[1]
 
 
-def evaluate(model, loader, device, epoch=None):
+def evaluate(
+    model,
+    loader,
+    device,
+    boundary_radius,
+    boundary_weight,
+    epoch=None,
+):
     model.eval()
     total_loss = 0.0
-    total_start_mae = 0.0
-    total_end_mae = 0.0
+    total_start_abs = 0.0
+    total_end_abs = 0.0
+    total_start_signed = 0.0
+    total_end_signed = 0.0
     total_iou = 0.0
+
+    start_within = {5: 0, 10: 0, 20: 0}
+    end_within = {5: 0, 10: 0, 20: 0}
     count = 0
 
     desc = f"Epoch {epoch:03d} val" if epoch is not None else "Validation"
@@ -65,7 +105,15 @@ def evaluate(model, loader, device, epoch=None):
             valid = batch["valid_mask"].to(device)
 
             logits = model(x).squeeze(1)
-            bce = masked_bce_with_logits(logits, y, valid)
+            bce = boundary_weighted_bce_with_logits(
+                logits,
+                y,
+                valid,
+                batch["starts"],
+                batch["ends"],
+                boundary_radius=boundary_radius,
+                boundary_weight=boundary_weight,
+            )
             dice = masked_dice_loss(logits, y, valid)
             loss = 0.5 * bce + 0.5 * dice
             total_loss += float(loss.item()) * x.size(0)
@@ -77,8 +125,19 @@ def evaluate(model, loader, device, epoch=None):
                 true_start = int(batch["starts"][i])
                 true_end = int(batch["ends"][i])
 
-                total_start_mae += abs(pred_start - true_start)
-                total_end_mae += abs(pred_end - true_end)
+                start_error = pred_start - true_start
+                end_error = pred_end - true_end
+
+                total_start_abs += abs(start_error)
+                total_end_abs += abs(end_error)
+                total_start_signed += start_error
+                total_end_signed += end_error
+
+                for threshold in start_within:
+                    if abs(start_error) <= threshold:
+                        start_within[threshold] += 1
+                    if abs(end_error) <= threshold:
+                        end_within[threshold] += 1
 
                 inter = max(0, min(pred_end, true_end) - max(pred_start, true_start))
                 union = max(pred_end, true_end) - min(pred_start, true_start)
@@ -87,11 +146,24 @@ def evaluate(model, loader, device, epoch=None):
 
             progress.set_postfix(val_loss=f"{loss.item():.4f}")
 
+    denom = max(count, 1)
+    start_mae = total_start_abs / denom
+    end_mae = total_end_abs / denom
+
     return {
-        "loss": total_loss / max(count, 1),
-        "start_mae": total_start_mae / max(count, 1),
-        "end_mae": total_end_mae / max(count, 1),
-        "interval_iou": total_iou / max(count, 1),
+        "loss": total_loss / denom,
+        "start_mae": start_mae,
+        "end_mae": end_mae,
+        "boundary_mae": (start_mae + end_mae) / 2.0,
+        "start_bias": total_start_signed / denom,
+        "end_bias": total_end_signed / denom,
+        "start_within_5bp": start_within[5] / denom,
+        "start_within_10bp": start_within[10] / denom,
+        "start_within_20bp": start_within[20] / denom,
+        "end_within_5bp": end_within[5] / denom,
+        "end_within_10bp": end_within[10] / denom,
+        "end_within_20bp": end_within[20] / denom,
+        "interval_iou": total_iou / denom,
     }
 
 
@@ -108,12 +180,43 @@ def main():
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--min-query-coverage", type=float, default=0.80)
     parser.add_argument(
+        "--boundary-radius",
+        type=int,
+        default=12,
+        help="Number of bases on each side of start/end receiving extra BCE weight.",
+    )
+    parser.add_argument(
+        "--boundary-weight",
+        type=float,
+        default=4.0,
+        help="BCE weight multiplier around the true start/end boundaries.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=12,
+        help="Stop after this many epochs without boundary-MAE improvement. 0 disables.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.05,
+        help="Minimum boundary-MAE improvement in bp required to reset patience.",
+    )
+    parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
         default="auto",
         help="Training device. Use --device cpu to force CPU training.",
     )
     args = parser.parse_args()
+
+    if args.boundary_radius < 0:
+        raise ValueError("--boundary-radius must be >= 0")
+    if args.boundary_weight < 1.0:
+        raise ValueError("--boundary-weight must be >= 1.0")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience must be >= 0")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -172,6 +275,18 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Training device: {device}", flush=True)
+    print(
+        f"Boundary weighting: radius={args.boundary_radius} bp, "
+        f"weight={args.boundary_weight:.1f}x",
+        flush=True,
+    )
+    if args.early_stopping_patience > 0:
+        print(
+            f"Early stopping: patience={args.early_stopping_patience}, "
+            f"min_delta={args.early_stopping_min_delta:.2f} bp "
+            f"(monitors boundary_mae)",
+            flush=True,
+        )
 
     model = UNet1D(input_channels=9, base_channels=32).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -182,7 +297,9 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    best_boundary_mae = float("inf")
     best_iou = -1.0
+    epochs_without_improvement = 0
     history = []
 
     for epoch in range(1, args.epochs + 1):
@@ -204,7 +321,15 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             logits = model(x).squeeze(1)
 
-            bce = masked_bce_with_logits(logits, y, valid)
+            bce = boundary_weighted_bce_with_logits(
+                logits,
+                y,
+                valid,
+                batch["starts"],
+                batch["ends"],
+                boundary_radius=args.boundary_radius,
+                boundary_weight=args.boundary_weight,
+            )
             dice = masked_dice_loss(logits, y, valid)
             loss = 0.5 * bce + 0.5 * dice
 
@@ -219,7 +344,14 @@ def main():
             )
 
         scheduler.step()
-        metrics = evaluate(model, val_loader, device, epoch=epoch)
+        metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            boundary_radius=args.boundary_radius,
+            boundary_weight=args.boundary_weight,
+            epoch=epoch,
+        )
         metrics["epoch"] = epoch
         metrics["train_loss"] = running / max(seen, 1)
         history.append(metrics)
@@ -230,7 +362,10 @@ def main():
             f"val_loss={metrics['loss']:.4f} "
             f"iou={metrics['interval_iou']:.4f} "
             f"start_mae={metrics['start_mae']:.2f} "
-            f"end_mae={metrics['end_mae']:.2f}",
+            f"end_mae={metrics['end_mae']:.2f} "
+            f"end_bias={metrics['end_bias']:+.2f} "
+            f"end<=10bp={metrics['end_within_10bp']:.1%} "
+            f"end<=20bp={metrics['end_within_20bp']:.1%}",
             flush=True,
         )
 
@@ -240,15 +375,46 @@ def main():
             "base_channels": 32,
             "epoch": epoch,
             "metrics": metrics,
+            "training_config": {
+                "boundary_radius": args.boundary_radius,
+                "boundary_weight": args.boundary_weight,
+                "val_ratio": args.val_ratio,
+                "seed": args.seed,
+            },
         }
         torch.save(checkpoint, output_dir / "last.pth")
 
+        boundary_improved = (
+            metrics["boundary_mae"]
+            < best_boundary_mae - args.early_stopping_min_delta
+        )
+        if boundary_improved:
+            best_boundary_mae = metrics["boundary_mae"]
+            epochs_without_improvement = 0
+            torch.save(checkpoint, output_dir / "best.pth")
+            torch.save(checkpoint, output_dir / "best_boundary.pth")
+        else:
+            epochs_without_improvement += 1
+
         if metrics["interval_iou"] > best_iou:
             best_iou = metrics["interval_iou"]
-            torch.save(checkpoint, output_dir / "best.pth")
+            torch.save(checkpoint, output_dir / "best_iou.pth")
 
         with open(output_dir / "history.json", "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
+
+        if (
+            args.early_stopping_patience > 0
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            print(
+                f"Early stopping at epoch {epoch}: boundary_mae has not improved "
+                f"by at least {args.early_stopping_min_delta:.2f} bp for "
+                f"{args.early_stopping_patience} epochs. "
+                f"Best boundary_mae={best_boundary_mae:.2f} bp.",
+                flush=True,
+            )
+            break
 
 
 if __name__ == "__main__":
