@@ -193,3 +193,42 @@ python train_ab1.py \
 - `best_boundary.pth`：与 best.pth 相同，明确表示边界最佳
 - `best_iou.pth`：按最高 interval IoU 保存
 - `last.pth`：最后一个 epoch
+
+
+## 1D ResNet50 U-Net 对比实验
+
+已增加 `nets/unet_resnet_1d.py`，编码器采用标准 ResNet-50 bottleneck 深度：
+
+```text
+[3, 4, 6, 3]
+```
+
+所有 2D 操作都改为 1D，输入仍然是相同的 9 通道 AB1 base-level 特征，decoder 使用 U-Net skip connection。
+
+训练 ResNet50：
+
+```powershell
+python train_ab1.py \
+  --raw-dir data/raw \
+  --trimmed-dir data/trimmed \
+  --output-dir logs_ab1_resnet50 \
+  --epochs 100 \
+  --batch-size 8 \
+  --device cpu \
+  --backbone resnet50
+```
+
+原始 baseline 仍可使用：
+
+```powershell
+python train_ab1.py \
+  --raw-dir data/raw \
+  --trimmed-dir data/trimmed \
+  --output-dir logs_ab1_plain \
+  --epochs 100 \
+  --batch-size 8 \
+  --device cpu \
+  --backbone plain
+```
+
+checkpoint 会保存 `backbone` 字段，`predict_ab1.py` 会自动选择正确的网络结构。
