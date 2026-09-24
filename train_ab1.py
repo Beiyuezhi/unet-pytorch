@@ -10,6 +10,15 @@ from tqdm import tqdm
 
 from datasets.ab1_dataset import AB1PairDataset, collate_ab1_batch, discover_pairs
 from nets.unet_1d import UNet1D
+from nets.unet_resnet_1d import ResNet50UNet1D
+
+
+def build_model(backbone: str, input_channels: int = 9):
+    if backbone == "plain":
+        return UNet1D(input_channels=input_channels, base_channels=32)
+    if backbone == "resnet50":
+        return ResNet50UNet1D(input_channels=input_channels)
+    raise ValueError(f"Unsupported backbone: {backbone}")
 
 
 def boundary_weighted_bce_with_logits(
@@ -21,12 +30,6 @@ def boundary_weighted_bce_with_logits(
     boundary_radius=12,
     boundary_weight=4.0,
 ):
-    """
-    BCE over the full sequence, with extra weight around the true trim boundaries.
-
-    start is inclusive and end is exclusive. Positions within +/- boundary_radius
-    bases of either boundary receive boundary_weight times the normal BCE weight.
-    """
     per_position = F.binary_cross_entropy_with_logits(
         logits, targets, reduction="none"
     )
@@ -180,6 +183,12 @@ def main():
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--min-query-coverage", type=float, default=0.80)
     parser.add_argument(
+        "--backbone",
+        choices=["plain", "resnet50"],
+        default="plain",
+        help="plain = original 1D U-Net, resnet50 = 1D ResNet50 encoder + U-Net decoder.",
+    )
+    parser.add_argument(
         "--boundary-radius",
         type=int,
         default=12,
@@ -275,6 +284,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Training device: {device}", flush=True)
+    print(f"Backbone: {args.backbone}", flush=True)
     print(
         f"Boundary weighting: radius={args.boundary_radius} bp, "
         f"weight={args.boundary_weight:.1f}x",
@@ -288,7 +298,10 @@ def main():
             flush=True,
         )
 
-    model = UNet1D(input_channels=9, base_channels=32).to(device)
+    model = build_model(args.backbone, input_channels=9).to(device)
+    parameter_count = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {parameter_count:,}", flush=True)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(args.epochs, 1)
@@ -372,10 +385,12 @@ def main():
         checkpoint = {
             "model_state": model.state_dict(),
             "input_channels": 9,
-            "base_channels": 32,
+            "base_channels": 32 if args.backbone == "plain" else None,
+            "backbone": args.backbone,
             "epoch": epoch,
             "metrics": metrics,
             "training_config": {
+                "backbone": args.backbone,
                 "boundary_radius": args.boundary_radius,
                 "boundary_weight": args.boundary_weight,
                 "val_ratio": args.val_ratio,
