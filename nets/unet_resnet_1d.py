@@ -53,15 +53,19 @@ class Bottleneck1D(nn.Module):
         return out
 
 
-class ResNet50Encoder1D(nn.Module):
+class ResNetEncoder1D(nn.Module):
     """
-    1D adaptation of the standard ResNet-50 encoder.
+    Generic 1D ResNet bottleneck encoder.
 
-    Stage depths are the canonical ResNet-50 layout: [3, 4, 6, 3].
+    ResNet-50:  [3, 4, 6, 3]
+    ResNet-101: [3, 4, 23, 3]
     """
 
-    def __init__(self, input_channels=9):
+    def __init__(self, input_channels=9, layers=(3, 4, 6, 3)):
         super().__init__()
+        if len(layers) != 4:
+            raise ValueError("layers must contain exactly four stage depths")
+
         self.in_channels = 64
 
         self.stem = nn.Sequential(
@@ -78,10 +82,10 @@ class ResNet50Encoder1D(nn.Module):
         )
         self.pool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(64, blocks=3, stride=1)   # 256, /4
-        self.layer2 = self._make_layer(128, blocks=4, stride=2)  # 512, /8
-        self.layer3 = self._make_layer(256, blocks=6, stride=2)  # 1024, /16
-        self.layer4 = self._make_layer(512, blocks=3, stride=2)  # 2048, /32
+        self.layer1 = self._make_layer(64, blocks=layers[0], stride=1)   # 256, /4
+        self.layer2 = self._make_layer(128, blocks=layers[1], stride=2)  # 512, /8
+        self.layer3 = self._make_layer(256, blocks=layers[2], stride=2)  # 1024, /16
+        self.layer4 = self._make_layer(512, blocks=layers[3], stride=2)  # 2048, /32
 
     def _make_layer(self, channels, blocks, stride):
         layers = [Bottleneck1D(self.in_channels, channels, stride=stride)]
@@ -98,6 +102,16 @@ class ResNet50Encoder1D(nn.Module):
         x3 = self.layer3(x2)    # 1024, /16
         x4 = self.layer4(x3)    # 2048, /32
         return x0, x1, x2, x3, x4
+
+
+class ResNet50Encoder1D(ResNetEncoder1D):
+    def __init__(self, input_channels=9):
+        super().__init__(input_channels=input_channels, layers=(3, 4, 6, 3))
+
+
+class ResNet101Encoder1D(ResNetEncoder1D):
+    def __init__(self, input_channels=9):
+        super().__init__(input_channels=input_channels, layers=(3, 4, 23, 3))
 
 
 class DecoderBlock1D(nn.Module):
@@ -132,9 +146,9 @@ class DecoderBlock1D(nn.Module):
         return self.block(x)
 
 
-class ResNet50UNet1D(nn.Module):
+class ResNetUNet1D(nn.Module):
     """
-    1D U-Net using a true ResNet-50 bottleneck encoder.
+    1D U-Net with a bottleneck ResNet encoder.
 
     Input:
         [batch, 9, n_bases]
@@ -143,9 +157,12 @@ class ResNet50UNet1D(nn.Module):
         logits [batch, 1, n_bases]
     """
 
-    def __init__(self, input_channels=9):
+    def __init__(self, input_channels=9, layers=(3, 4, 6, 3)):
         super().__init__()
-        self.encoder = ResNet50Encoder1D(input_channels=input_channels)
+        self.encoder = ResNetEncoder1D(
+            input_channels=input_channels,
+            layers=layers,
+        )
 
         self.up4 = DecoderBlock1D(2048, 1024, 512)
         self.up3 = DecoderBlock1D(512, 512, 256)
@@ -179,3 +196,13 @@ class ResNet50UNet1D(nn.Module):
         )
         x = self.final_refine(x)
         return self.outc(x)
+
+
+class ResNet50UNet1D(ResNetUNet1D):
+    def __init__(self, input_channels=9):
+        super().__init__(input_channels=input_channels, layers=(3, 4, 6, 3))
+
+
+class ResNet101UNet1D(ResNetUNet1D):
+    def __init__(self, input_channels=9):
+        super().__init__(input_channels=input_channels, layers=(3, 4, 23, 3))
