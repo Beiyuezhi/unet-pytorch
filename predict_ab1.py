@@ -3,7 +3,7 @@ import argparse
 import torch
 
 from nets.unet_1d import UNet1D
-from nets.unet_resnet_1d import ResNet50UNet1D
+from nets.unet_resnet_1d import ResNet50UNet1D, ResNet101UNet1D
 from train_ab1 import interval_from_probs
 from utils.ab1_features import load_ab1_base_features
 
@@ -14,6 +14,8 @@ def build_model_from_checkpoint(checkpoint):
 
     if backbone == "resnet50":
         model = ResNet50UNet1D(input_channels=input_channels)
+    elif backbone == "resnet101":
+        model = ResNet101UNet1D(input_channels=input_channels)
     else:
         model = UNet1D(
             input_channels=input_channels,
