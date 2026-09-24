@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from datasets.ab1_dataset import AB1PairDataset, collate_ab1_batch, discover_pairs
 from nets.unet_1d import UNet1D
@@ -27,10 +28,6 @@ def masked_dice_loss(logits, targets, valid_mask, eps=1e-6):
 
 
 def interval_from_probs(probs, threshold=0.5):
-    """
-    Convert per-base probabilities into one continuous interval.
-    Uses the longest positive run; ties prefer the run with larger probability sum.
-    """
     keep = probs >= threshold
     best = (0, 0, -1.0)
     start = None
@@ -50,7 +47,7 @@ def interval_from_probs(probs, threshold=0.5):
     return best[0], best[1]
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, epoch=None):
     model.eval()
     total_loss = 0.0
     total_start_mae = 0.0
@@ -58,8 +55,11 @@ def evaluate(model, loader, device):
     total_iou = 0.0
     count = 0
 
+    desc = f"Epoch {epoch:03d} val" if epoch is not None else "Validation"
+    progress = tqdm(loader, desc=desc, unit="batch", leave=False)
+
     with torch.no_grad():
-        for batch in loader:
+        for batch in progress:
             x = batch["features"].to(device)
             y = batch["target"].to(device)
             valid = batch["valid_mask"].to(device)
@@ -85,6 +85,8 @@ def evaluate(model, loader, device):
                 total_iou += inter / union if union > 0 else 0.0
                 count += 1
 
+            progress.set_postfix(val_loss=f"{loss.item():.4f}")
+
     return {
         "loss": total_loss / max(count, 1),
         "start_mae": total_start_mae / max(count, 1),
@@ -105,12 +107,19 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--min-query-coverage", type=float, default=0.80)
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Training device. Use --device cpu to force CPU training.",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     pairs = discover_pairs(args.raw_dir, args.trimmed_dir)
+    print(f"Found {len(pairs)} paired AB1 files.", flush=True)
     random.shuffle(pairs)
 
     if len(pairs) < 2:
@@ -123,8 +132,20 @@ def main():
         train_pairs = pairs[:-1]
         val_pairs = pairs[-1:]
 
-    train_ds = AB1PairDataset(train_pairs, args.min_query_coverage)
-    val_ds = AB1PairDataset(val_pairs, args.min_query_coverage)
+    print(
+        f"Preparing labels once: train={len(train_pairs)}, val={len(val_pairs)}",
+        flush=True,
+    )
+    train_ds = AB1PairDataset(
+        train_pairs,
+        args.min_query_coverage,
+        prepare_desc="Preparing train labels",
+    )
+    val_ds = AB1PairDataset(
+        val_pairs,
+        args.min_query_coverage,
+        prepare_desc="Preparing val labels",
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -141,7 +162,17 @@ def main():
         collate_fn=collate_ab1_batch,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "cpu":
+        device = torch.device("cpu")
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested, but CUDA is not available.")
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Training device: {device}", flush=True)
+
     model = UNet1D(input_channels=9, base_channels=32).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -159,7 +190,13 @@ def main():
         running = 0.0
         seen = 0
 
-        for batch in train_loader:
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch:03d}/{args.epochs:03d} train",
+            unit="batch",
+        )
+
+        for batch in progress:
             x = batch["features"].to(device)
             y = batch["target"].to(device)
             valid = batch["valid_mask"].to(device)
@@ -176,9 +213,13 @@ def main():
 
             running += float(loss.item()) * x.size(0)
             seen += x.size(0)
+            progress.set_postfix(
+                loss=f"{loss.item():.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
 
         scheduler.step()
-        metrics = evaluate(model, val_loader, device)
+        metrics = evaluate(model, val_loader, device, epoch=epoch)
         metrics["epoch"] = epoch
         metrics["train_loss"] = running / max(seen, 1)
         history.append(metrics)
@@ -189,7 +230,8 @@ def main():
             f"val_loss={metrics['loss']:.4f} "
             f"iou={metrics['interval_iou']:.4f} "
             f"start_mae={metrics['start_mae']:.2f} "
-            f"end_mae={metrics['end_mae']:.2f}"
+            f"end_mae={metrics['end_mae']:.2f}",
+            flush=True,
         )
 
         checkpoint = {
