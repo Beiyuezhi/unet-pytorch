@@ -4,6 +4,7 @@ from typing import List, Tuple
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 from utils.ab1_alignment import labels_from_ab1_pair
 from utils.ab1_features import load_ab1_base_features
@@ -35,44 +36,73 @@ def discover_pairs(raw_dir: str, trimmed_dir: str) -> List[Tuple[Path, Path]]:
 
 
 class AB1PairDataset(Dataset):
+    """
+    Paired AB1 training dataset.
+
+    The expensive raw/trimmed sequence alignment is performed once when the
+    dataset is created. __getitem__ only loads raw AB1 model features and reuses
+    the prepared start/end labels, so alignment is not repeated every epoch.
+    """
+
     def __init__(
         self,
         pairs,
         min_query_coverage: float = 0.80,
+        show_prepare_progress: bool = True,
+        prepare_desc: str = "Preparing AB1 labels",
     ):
-        self.pairs = list(pairs)
-        self.min_query_coverage = min_query_coverage
+        self.samples = []
+
+        iterator = tqdm(
+            list(pairs),
+            desc=prepare_desc,
+            unit="pair",
+            disable=not show_prepare_progress,
+        )
+        for raw_path, trimmed_path in iterator:
+            alignment = labels_from_ab1_pair(
+                str(raw_path),
+                str(trimmed_path),
+                min_query_coverage=min_query_coverage,
+            )
+            self.samples.append(
+                {
+                    "raw_path": raw_path,
+                    "trimmed_path": trimmed_path,
+                    "start": alignment.start,
+                    "end": alignment.end,
+                    "coverage": alignment.query_coverage,
+                }
+            )
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.samples)
 
     def __getitem__(self, index):
-        raw_path, trimmed_path = self.pairs[index]
+        sample = self.samples[index]
+        raw_path = sample["raw_path"]
 
-        features, raw_sequence = load_ab1_base_features(str(raw_path))
-        alignment = labels_from_ab1_pair(
-            str(raw_path),
-            str(trimmed_path),
-            min_query_coverage=self.min_query_coverage,
-        )
-
+        features, _ = load_ab1_base_features(str(raw_path))
         length = features.shape[-1]
+
+        start = min(int(sample["start"]), length)
+        end = min(int(sample["end"]), length)
+
         target = torch.zeros(length, dtype=torch.float32)
-        target[alignment.start:alignment.end] = 1.0
+        target[start:end] = 1.0
 
         return {
             "features": torch.from_numpy(features),
             "target": target,
             "length": length,
             "filename": raw_path.name,
-            "start": alignment.start,
-            "end": alignment.end,
-            "coverage": alignment.query_coverage,
+            "start": start,
+            "end": end,
+            "coverage": sample["coverage"],
         }
 
 
 def collate_ab1_batch(batch):
-    # pad_sequence expects [L, C], so transpose before/after padding.
     feature_list = [item["features"].transpose(0, 1) for item in batch]
     features = pad_sequence(feature_list, batch_first=True).transpose(1, 2)
 
