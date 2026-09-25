@@ -166,7 +166,7 @@ requirements_ab1.txt
 - Dice loss 仍然保留
 - 默认 loss：`0.5 * boundary-weighted BCE + 0.5 * Dice`
 
-同时增加 early stopping，默认连续 12 个 epoch 的 `boundary_mae` 没有至少 0.05 bp 改善就停止。
+支持 early stopping，但默认关闭（`--early-stopping-patience 0`），因此默认会完整跑满 `--epochs`。如需提前停止，可手动设置例如 `--early-stopping-patience 12`。
 
 推荐 CPU 训练命令：
 
