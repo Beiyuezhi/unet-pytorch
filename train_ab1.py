@@ -205,8 +205,8 @@ def main():
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
-        default=12,
-        help="Stop after this many epochs without boundary-MAE improvement. 0 disables.",
+        default=0,
+        help="Stop after this many epochs without boundary-MAE improvement. Default 0 disables early stopping.",
     )
     parser.add_argument(
         "--early-stopping-min-delta",
