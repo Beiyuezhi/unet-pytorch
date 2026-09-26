@@ -268,3 +268,46 @@ resnet101
 ```
 
 checkpoint 会保存 backbone，`predict_ab1.py` 会自动恢复对应的 1D U-Net 结构。
+
+
+## Attention U-Net Skip Gates
+
+ResNet50 和 ResNet101 都支持 Attention U-Net 风格的 skip gate。
+
+开启方式：
+
+```powershell
+--attention-gates
+```
+
+ResNet50 + Attention Gate：
+
+```powershell
+python train_ab1.py \
+  --raw-dir data/raw \
+  --trimmed-dir data/trimmed \
+  --output-dir logs_ab1_resnet50_attn \
+  --epochs 100 \
+  --batch-size 8 \
+  --device cpu \
+  --backbone resnet50 \
+  --attention-gates
+```
+
+ResNet101 + Attention Gate：
+
+```powershell
+python train_ab1.py \
+  --raw-dir data/raw \
+  --trimmed-dir data/trimmed \
+  --output-dir logs_ab1_resnet101_attn \
+  --epochs 100 \
+  --batch-size 8 \
+  --device cpu \
+  --backbone resnet101 \
+  --attention-gates
+```
+
+不传 `--attention-gates` 时保持原来的 ResNet50/ResNet101 U-Net 行为，方便直接做消融对比。
+
+checkpoint 会保存 `attention_gates`，推理时会自动恢复对应结构。
