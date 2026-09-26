@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import random
 from pathlib import Path
 
@@ -9,27 +10,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from datasets.ab1_dataset import AB1PairDataset, collate_ab1_batch, discover_pairs
-from nets.unet_1d import UNet1D
 from nets.unet_resnet_1d import ResNet50UNet1D, ResNet101UNet1D
 
 
-def build_model(
-    backbone: str,
-    input_channels: int = 9,
-    attention_gates: bool = False,
-):
-    if backbone == "plain":
-        return UNet1D(input_channels=input_channels, base_channels=32)
+def build_model(backbone: str, input_channels: int = 9):
     if backbone == "resnet50":
-        return ResNet50UNet1D(
-            input_channels=input_channels,
-            attention_gates=attention_gates,
-        )
+        return ResNet50UNet1D(input_channels=input_channels)
     if backbone == "resnet101":
-        return ResNet101UNet1D(
-            input_channels=input_channels,
-            attention_gates=attention_gates,
-        )
+        return ResNet101UNet1D(input_channels=input_channels)
     raise ValueError(f"Unsupported backbone: {backbone}")
 
 
@@ -70,6 +58,41 @@ def masked_dice_loss(logits, targets, valid_mask, eps=1e-6):
     return 1.0 - dice.mean()
 
 
+def masked_boundary_losses(boundary_logits, starts, ends, lengths):
+    """
+    boundary_logits: [B, 2, L]
+      channel 0 -> start position
+      channel 1 -> inclusive end position (true end - 1)
+
+    Invalid padded positions are masked before cross entropy.
+    Losses are normalized by log(sequence length) so their scale is comparable
+    to the segmentation loss.
+    """
+    device = boundary_logits.device
+    _, _, max_len = boundary_logits.shape
+
+    lengths = lengths.to(device)
+    starts = starts.to(device).long().clamp_min(0)
+    end_targets = (ends.to(device).long() - 1).clamp_min(0)
+
+    starts = torch.minimum(starts, lengths - 1)
+    end_targets = torch.minimum(end_targets, lengths - 1)
+
+    positions = torch.arange(max_len, device=device).unsqueeze(0)
+    valid = positions < lengths.unsqueeze(1)
+
+    start_logits = boundary_logits[:, 0, :].masked_fill(~valid, -1e4)
+    end_logits = boundary_logits[:, 1, :].masked_fill(~valid, -1e4)
+
+    start_ce = F.cross_entropy(start_logits, starts)
+    end_ce = F.cross_entropy(end_logits, end_targets)
+
+    mean_length = lengths.float().mean().clamp_min(2.0)
+    normalizer = math.log(float(mean_length.item()) + 1.0)
+
+    return start_ce / normalizer, end_ce / normalizer
+
+
 def interval_from_probs(probs, threshold=0.5):
     keep = probs >= threshold
     best = (0, 0, -1.0)
@@ -90,12 +113,76 @@ def interval_from_probs(probs, threshold=0.5):
     return best[0], best[1]
 
 
+def interval_from_model_outputs(seg_probs, boundary_logits, length):
+    """
+    Boundary head is the primary predictor.
+    If it produces an invalid interval, fall back to the segmentation mask.
+    """
+    start_logits = boundary_logits[0, :length]
+    end_logits = boundary_logits[1, :length]
+
+    pred_start = int(torch.argmax(start_logits).item())
+    pred_end = int(torch.argmax(end_logits).item()) + 1
+
+    used_fallback = False
+    if pred_end <= pred_start:
+        pred_start, pred_end = interval_from_probs(seg_probs[:length])
+        used_fallback = True
+
+    return pred_start, pred_end, used_fallback
+
+
+def compute_loss(
+    outputs,
+    batch,
+    device,
+    boundary_radius,
+    boundary_weight,
+    start_head_weight,
+    end_head_weight,
+):
+    y = batch["target"].to(device)
+    valid = batch["valid_mask"].to(device)
+
+    seg_logits = outputs["seg_logits"].squeeze(1)
+    boundary_logits = outputs["boundary_logits"]
+
+    bce = boundary_weighted_bce_with_logits(
+        seg_logits,
+        y,
+        valid,
+        batch["starts"],
+        batch["ends"],
+        boundary_radius=boundary_radius,
+        boundary_weight=boundary_weight,
+    )
+    dice = masked_dice_loss(seg_logits, y, valid)
+    seg_loss = 0.5 * bce + 0.5 * dice
+
+    start_loss, end_loss = masked_boundary_losses(
+        boundary_logits,
+        batch["starts"],
+        batch["ends"],
+        batch["lengths"],
+    )
+
+    total = (
+        seg_loss
+        + start_head_weight * start_loss
+        + end_head_weight * end_loss
+    )
+
+    return total, seg_loss, start_loss, end_loss
+
+
 def evaluate(
     model,
     loader,
     device,
     boundary_radius,
     boundary_weight,
+    start_head_weight,
+    end_head_weight,
     epoch=None,
 ):
     model.eval()
@@ -105,6 +192,7 @@ def evaluate(
     total_start_signed = 0.0
     total_end_signed = 0.0
     total_iou = 0.0
+    fallback_count = 0
 
     start_within = {5: 0, 10: 0, 20: 0}
     end_within = {5: 0, 10: 0, 20: 0}
@@ -116,27 +204,31 @@ def evaluate(
     with torch.no_grad():
         for batch in progress:
             x = batch["features"].to(device)
-            y = batch["target"].to(device)
-            valid = batch["valid_mask"].to(device)
+            outputs = model(x)
 
-            logits = model(x).squeeze(1)
-            bce = boundary_weighted_bce_with_logits(
-                logits,
-                y,
-                valid,
-                batch["starts"],
-                batch["ends"],
-                boundary_radius=boundary_radius,
-                boundary_weight=boundary_weight,
+            loss, _, _, _ = compute_loss(
+                outputs,
+                batch,
+                device,
+                boundary_radius,
+                boundary_weight,
+                start_head_weight,
+                end_head_weight,
             )
-            dice = masked_dice_loss(logits, y, valid)
-            loss = 0.5 * bce + 0.5 * dice
             total_loss += float(loss.item()) * x.size(0)
 
-            probs = torch.sigmoid(logits).cpu()
+            seg_probs = torch.sigmoid(outputs["seg_logits"].squeeze(1)).cpu()
+            boundary_logits = outputs["boundary_logits"].cpu()
+
             for i in range(x.size(0)):
                 length = int(batch["lengths"][i])
-                pred_start, pred_end = interval_from_probs(probs[i, :length])
+                pred_start, pred_end, used_fallback = interval_from_model_outputs(
+                    seg_probs[i],
+                    boundary_logits[i],
+                    length,
+                )
+                fallback_count += int(used_fallback)
+
                 true_start = int(batch["starts"][i])
                 true_end = int(batch["ends"][i])
 
@@ -179,6 +271,7 @@ def evaluate(
         "end_within_10bp": end_within[10] / denom,
         "end_within_20bp": end_within[20] / denom,
         "interval_iou": total_iou / denom,
+        "boundary_fallback_rate": fallback_count / denom,
     }
 
 
@@ -196,44 +289,38 @@ def main():
     parser.add_argument("--min-query-coverage", type=float, default=0.80)
     parser.add_argument(
         "--backbone",
-        choices=["plain", "resnet50", "resnet101"],
-        default="plain",
-        help="plain = original 1D U-Net, resnet50/resnet101 = 1D ResNet encoder + U-Net decoder.",
+        choices=["resnet50", "resnet101"],
+        default="resnet50",
     )
+    parser.add_argument("--boundary-radius", type=int, default=12)
+    parser.add_argument("--boundary-weight", type=float, default=4.0)
     parser.add_argument(
-        "--attention-gates",
-        action="store_true",
-        help="Enable Attention U-Net gates on ResNet50/ResNet101 skip connections.",
-    )
-    parser.add_argument(
-        "--boundary-radius",
-        type=int,
-        default=12,
-        help="Number of bases on each side of start/end receiving extra BCE weight.",
-    )
-    parser.add_argument(
-        "--boundary-weight",
+        "--start-head-weight",
         type=float,
-        default=4.0,
-        help="BCE weight multiplier around the true start/end boundaries.",
+        default=0.3,
+        help="Weight for normalized start-boundary CE loss.",
+    )
+    parser.add_argument(
+        "--end-head-weight",
+        type=float,
+        default=0.7,
+        help="Weight for normalized end-boundary CE loss.",
     )
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=0,
-        help="Stop after this many epochs without boundary-MAE improvement. Default 0 disables early stopping.",
+        help="0 disables early stopping and runs all epochs.",
     )
     parser.add_argument(
         "--early-stopping-min-delta",
         type=float,
         default=0.05,
-        help="Minimum boundary-MAE improvement in bp required to reset patience.",
     )
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
         default="auto",
-        help="Training device. Use --device cpu to force CPU training.",
     )
     args = parser.parse_args()
 
@@ -241,8 +328,8 @@ def main():
         raise ValueError("--boundary-radius must be >= 0")
     if args.boundary_weight < 1.0:
         raise ValueError("--boundary-weight must be >= 1.0")
-    if args.early_stopping_patience < 0:
-        raise ValueError("--early-stopping-patience must be >= 0")
+    if args.start_head_weight < 0 or args.end_head_weight < 0:
+        raise ValueError("boundary head weights must be >= 0")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -257,9 +344,6 @@ def main():
     val_size = max(1, int(round(len(pairs) * args.val_ratio)))
     val_pairs = pairs[:val_size]
     train_pairs = pairs[val_size:]
-    if not train_pairs:
-        train_pairs = pairs[:-1]
-        val_pairs = pairs[-1:]
 
     print(
         f"Preparing labels once: train={len(train_pairs)}, val={len(val_pairs)}",
@@ -302,28 +386,14 @@ def main():
 
     print(f"Training device: {device}", flush=True)
     print(f"Backbone: {args.backbone}", flush=True)
+    print("Architecture: ECA + Dilated(1,2,4,8) + Attention U-Net + Boundary Head", flush=True)
     print(
-        f"Attention gates: {'on' if args.attention_gates else 'off'}",
+        f"Loss weights: segmentation=1.0 start={args.start_head_weight} "
+        f"end={args.end_head_weight}",
         flush=True,
     )
-    print(
-        f"Boundary weighting: radius={args.boundary_radius} bp, "
-        f"weight={args.boundary_weight:.1f}x",
-        flush=True,
-    )
-    if args.early_stopping_patience > 0:
-        print(
-            f"Early stopping: patience={args.early_stopping_patience}, "
-            f"min_delta={args.early_stopping_min_delta:.2f} bp "
-            f"(monitors boundary_mae)",
-            flush=True,
-        )
 
-    model = build_model(
-        args.backbone,
-        input_channels=9,
-        attention_gates=args.attention_gates,
-    ).to(device)
+    model = build_model(args.backbone, input_channels=9).to(device)
     parameter_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {parameter_count:,}", flush=True)
 
@@ -336,13 +406,17 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     best_boundary_mae = float("inf")
-    best_iou = -1.0
+    early_stop_reference = float("inf")
     epochs_without_improvement = 0
+    best_iou = -1.0
     history = []
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
+        running_seg = 0.0
+        running_start = 0.0
+        running_end = 0.0
         seen = 0
 
         progress = tqdm(
@@ -353,45 +427,54 @@ def main():
 
         for batch in progress:
             x = batch["features"].to(device)
-            y = batch["target"].to(device)
-            valid = batch["valid_mask"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(x).squeeze(1)
+            outputs = model(x)
 
-            bce = boundary_weighted_bce_with_logits(
-                logits,
-                y,
-                valid,
-                batch["starts"],
-                batch["ends"],
-                boundary_radius=args.boundary_radius,
-                boundary_weight=args.boundary_weight,
+            loss, seg_loss, start_loss, end_loss = compute_loss(
+                outputs,
+                batch,
+                device,
+                args.boundary_radius,
+                args.boundary_weight,
+                args.start_head_weight,
+                args.end_head_weight,
             )
-            dice = masked_dice_loss(logits, y, valid)
-            loss = 0.5 * bce + 0.5 * dice
 
             loss.backward()
             optimizer.step()
 
-            running += float(loss.item()) * x.size(0)
-            seen += x.size(0)
+            batch_size = x.size(0)
+            running += float(loss.item()) * batch_size
+            running_seg += float(seg_loss.item()) * batch_size
+            running_start += float(start_loss.item()) * batch_size
+            running_end += float(end_loss.item()) * batch_size
+            seen += batch_size
+
             progress.set_postfix(
                 loss=f"{loss.item():.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                seg=f"{seg_loss.item():.4f}",
+                start=f"{start_loss.item():.3f}",
+                end=f"{end_loss.item():.3f}",
             )
 
         scheduler.step()
+
         metrics = evaluate(
             model,
             val_loader,
             device,
-            boundary_radius=args.boundary_radius,
-            boundary_weight=args.boundary_weight,
+            args.boundary_radius,
+            args.boundary_weight,
+            args.start_head_weight,
+            args.end_head_weight,
             epoch=epoch,
         )
         metrics["epoch"] = epoch
         metrics["train_loss"] = running / max(seen, 1)
+        metrics["train_seg_loss"] = running_seg / max(seen, 1)
+        metrics["train_start_head_loss"] = running_start / max(seen, 1)
+        metrics["train_end_head_loss"] = running_end / max(seen, 1)
         history.append(metrics)
 
         print(
@@ -403,44 +486,39 @@ def main():
             f"end_mae={metrics['end_mae']:.2f} "
             f"end_bias={metrics['end_bias']:+.2f} "
             f"end<=10bp={metrics['end_within_10bp']:.1%} "
-            f"end<=20bp={metrics['end_within_20bp']:.1%}",
+            f"end<=20bp={metrics['end_within_20bp']:.1%} "
+            f"fallback={metrics['boundary_fallback_rate']:.1%}",
             flush=True,
         )
 
         checkpoint = {
             "model_state": model.state_dict(),
             "input_channels": 9,
-            "base_channels": 32 if args.backbone == "plain" else None,
             "backbone": args.backbone,
-            "attention_gates": args.attention_gates,
             "epoch": epoch,
             "metrics": metrics,
-            "training_config": {
-                "backbone": args.backbone,
-                "attention_gates": args.attention_gates,
-                "boundary_radius": args.boundary_radius,
-                "boundary_weight": args.boundary_weight,
-                "val_ratio": args.val_ratio,
-                "seed": args.seed,
-            },
+            "architecture": "enhanced_resnet_unet_1d_v1",
+            "training_config": vars(args),
         }
         torch.save(checkpoint, output_dir / "last.pth")
 
-        boundary_improved = (
-            metrics["boundary_mae"]
-            < best_boundary_mae - args.early_stopping_min_delta
-        )
-        if boundary_improved:
+        if metrics["boundary_mae"] < best_boundary_mae:
             best_boundary_mae = metrics["boundary_mae"]
-            epochs_without_improvement = 0
             torch.save(checkpoint, output_dir / "best.pth")
             torch.save(checkpoint, output_dir / "best_boundary.pth")
-        else:
-            epochs_without_improvement += 1
 
         if metrics["interval_iou"] > best_iou:
             best_iou = metrics["interval_iou"]
             torch.save(checkpoint, output_dir / "best_iou.pth")
+
+        if (
+            metrics["boundary_mae"]
+            < early_stop_reference - args.early_stopping_min_delta
+        ):
+            early_stop_reference = metrics["boundary_mae"]
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
         with open(output_dir / "history.json", "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
@@ -450,10 +528,8 @@ def main():
             and epochs_without_improvement >= args.early_stopping_patience
         ):
             print(
-                f"Early stopping at epoch {epoch}: boundary_mae has not improved "
-                f"by at least {args.early_stopping_min_delta:.2f} bp for "
-                f"{args.early_stopping_patience} epochs. "
-                f"Best boundary_mae={best_boundary_mae:.2f} bp.",
+                f"Early stopping at epoch {epoch}; "
+                f"best boundary_mae={best_boundary_mae:.2f} bp.",
                 flush=True,
             )
             break
