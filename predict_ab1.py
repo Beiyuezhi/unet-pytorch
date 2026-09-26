@@ -11,17 +11,24 @@ from utils.ab1_features import load_ab1_base_features
 def build_model_from_checkpoint(checkpoint):
     backbone = checkpoint.get("backbone", "plain")
     input_channels = checkpoint.get("input_channels", 9)
+    attention_gates = checkpoint.get("attention_gates", False)
 
     if backbone == "resnet50":
-        model = ResNet50UNet1D(input_channels=input_channels)
+        model = ResNet50UNet1D(
+            input_channels=input_channels,
+            attention_gates=attention_gates,
+        )
     elif backbone == "resnet101":
-        model = ResNet101UNet1D(input_channels=input_channels)
+        model = ResNet101UNet1D(
+            input_channels=input_channels,
+            attention_gates=attention_gates,
+        )
     else:
         model = UNet1D(
             input_channels=input_channels,
             base_channels=checkpoint.get("base_channels", 32) or 32,
         )
-    return model, backbone
+    return model, backbone, attention_gates
 
 
 def main():
@@ -46,7 +53,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     checkpoint = torch.load(args.model, map_location=device)
-    model, backbone = build_model_from_checkpoint(checkpoint)
+    model, backbone, attention_gates = build_model_from_checkpoint(checkpoint)
     model = model.to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -60,6 +67,7 @@ def main():
     start, end = interval_from_probs(probs, args.threshold)
 
     print(f"backbone={backbone}")
+    print(f"attention_gates={attention_gates}")
     print(f"bases={len(sequence)}")
     print(f"start={start}")
     print(f"end={end}")
