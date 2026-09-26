@@ -13,13 +13,23 @@ from nets.unet_1d import UNet1D
 from nets.unet_resnet_1d import ResNet50UNet1D, ResNet101UNet1D
 
 
-def build_model(backbone: str, input_channels: int = 9):
+def build_model(
+    backbone: str,
+    input_channels: int = 9,
+    attention_gates: bool = False,
+):
     if backbone == "plain":
         return UNet1D(input_channels=input_channels, base_channels=32)
     if backbone == "resnet50":
-        return ResNet50UNet1D(input_channels=input_channels)
+        return ResNet50UNet1D(
+            input_channels=input_channels,
+            attention_gates=attention_gates,
+        )
     if backbone == "resnet101":
-        return ResNet101UNet1D(input_channels=input_channels)
+        return ResNet101UNet1D(
+            input_channels=input_channels,
+            attention_gates=attention_gates,
+        )
     raise ValueError(f"Unsupported backbone: {backbone}")
 
 
@@ -191,6 +201,11 @@ def main():
         help="plain = original 1D U-Net, resnet50/resnet101 = 1D ResNet encoder + U-Net decoder.",
     )
     parser.add_argument(
+        "--attention-gates",
+        action="store_true",
+        help="Enable Attention U-Net gates on ResNet50/ResNet101 skip connections.",
+    )
+    parser.add_argument(
         "--boundary-radius",
         type=int,
         default=12,
@@ -288,6 +303,10 @@ def main():
     print(f"Training device: {device}", flush=True)
     print(f"Backbone: {args.backbone}", flush=True)
     print(
+        f"Attention gates: {'on' if args.attention_gates else 'off'}",
+        flush=True,
+    )
+    print(
         f"Boundary weighting: radius={args.boundary_radius} bp, "
         f"weight={args.boundary_weight:.1f}x",
         flush=True,
@@ -300,7 +319,11 @@ def main():
             flush=True,
         )
 
-    model = build_model(args.backbone, input_channels=9).to(device)
+    model = build_model(
+        args.backbone,
+        input_channels=9,
+        attention_gates=args.attention_gates,
+    ).to(device)
     parameter_count = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {parameter_count:,}", flush=True)
 
@@ -389,10 +412,12 @@ def main():
             "input_channels": 9,
             "base_channels": 32 if args.backbone == "plain" else None,
             "backbone": args.backbone,
+            "attention_gates": args.attention_gates,
             "epoch": epoch,
             "metrics": metrics,
             "training_config": {
                 "backbone": args.backbone,
+                "attention_gates": args.attention_gates,
                 "boundary_radius": args.boundary_radius,
                 "boundary_weight": args.boundary_weight,
                 "val_ratio": args.val_ratio,
