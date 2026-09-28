@@ -1,4 +1,3 @@
-import argparse
 from pathlib import Path
 
 import torch
@@ -7,6 +6,34 @@ from nets.unet_resnet_1d import ResNet50UNet1D, ResNet101UNet1D
 from train_ab1 import interval_from_model_outputs
 from utils.ab1_features import load_ab1_base_features
 from utils.ab1_trim import write_trimmed_ab1
+
+
+# ============================================================
+# Prediction configuration
+# Edit these values directly, then run:
+#   python predict_ab1.py
+# ============================================================
+
+# One .ab1 file OR a directory containing .ab1 files.
+AB1_INPUT = r"data/raw"
+
+# Trained checkpoint.
+MODEL_PATH = r"logs_ab1_resnet50_enhanced/best.pth"
+
+# "auto", "cpu", or "cuda".
+DEVICE = "auto"
+
+# False: only print predicted start/end.
+# True : also write cropped AB1 files.
+SAVE_TRIMMED_AB1 = False
+
+# Output directory for cropped AB1 files.
+# None means:
+#   directory input -> <AB1_INPUT>/predicted_trimmed
+#   file input      -> <input file directory>/predicted_trimmed
+#
+# Output file names are identical to the original AB1 file names.
+TRIMMED_AB1_DIR = None
 
 
 def build_model(backbone, input_channels=9):
@@ -102,50 +129,30 @@ def output_path_for(
     return output_root / source_path.name
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--ab1",
-        required=True,
-        help=(
-            "Input .ab1 file or directory. Directory input is scanned "
-            "recursively, including all subdirectories."
-        ),
-    )
-    parser.add_argument("--model", required=True)
-    parser.add_argument(
-        "--save-trimmed-ab1",
-        action="store_true",
-        help="Write predicted intervals as new AB1 files. Disabled by default.",
-    )
-    parser.add_argument(
-        "--trimmed-ab1-dir",
-        default=None,
-        help=(
-            "Root directory for trimmed AB1 output. "
-            "For directory input, relative subdirectory structure is preserved. "
-            "Default: <input>/predicted_trimmed"
-        ),
-    )
-    parser.add_argument(
-        "--device",
-        choices=["auto", "cpu", "cuda"],
-        default="auto",
-    )
-    args = parser.parse_args()
+def resolve_device():
+    requested = DEVICE.lower()
 
-    input_path = Path(args.ab1)
+    if requested == "cpu":
+        return torch.device("cpu")
 
-    if args.device == "cpu":
-        device = torch.device("cpu")
-    elif args.device == "cuda":
+    if requested == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("--device cuda requested, but CUDA is not available.")
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            raise RuntimeError(
+                "DEVICE='cuda' requested, but CUDA is not available."
+            )
+        return torch.device("cuda")
 
-    checkpoint = torch.load(args.model, map_location=device)
+    if requested != "auto":
+        raise ValueError("DEVICE must be 'auto', 'cpu', or 'cuda'")
+
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def main():
+    input_path = Path(AB1_INPUT)
+    device = resolve_device()
+
+    checkpoint = torch.load(MODEL_PATH, map_location=device)
     backbone = checkpoint["backbone"]
     input_channels = checkpoint.get("input_channels", 9)
 
@@ -154,8 +161,8 @@ def main():
     model.eval()
 
     output_root = (
-        resolve_output_root(input_path, args.trimmed_ab1_dir)
-        if args.save_trimmed_ab1
+        resolve_output_root(input_path, TRIMMED_AB1_DIR)
+        if SAVE_TRIMMED_AB1
         else None
     )
 
