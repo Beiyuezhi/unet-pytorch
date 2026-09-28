@@ -279,3 +279,68 @@ data/trimmed_predicted/sample001.ab1
 - FWO_1 channel order
 
 peak positions 会按新的 trace 起点重新定位。
+
+
+## 批量预测：文件或目录输入
+
+`--ab1` 现在既支持单个 AB1 文件，也支持目录。
+
+传目录时会递归读取该目录及所有子目录中的 `.ab1` 文件。
+
+例如：
+
+```powershell
+python predict_ab1.py `
+  --ab1 data/raw `
+  --model logs_ab1_resnet50_enhanced/best.pth `
+  --device cpu
+```
+
+如果同时生成裁剪后的 AB1：
+
+```powershell
+python predict_ab1.py `
+  --ab1 data/raw `
+  --model logs_ab1_resnet50_enhanced/best.pth `
+  --device cpu `
+  --save-trimmed-ab1 `
+  --trimmed-ab1-dir D:/ab1_output
+```
+
+`--trimmed-ab1-dir` 用于指定输出根目录。
+
+例如输入目录：
+
+```text
+data/raw/
+  A.ab1
+  batch1/
+    B.ab1
+  batch2/sub/
+    C.ab1
+```
+
+指定：
+
+```text
+--trimmed-ab1-dir D:/ab1_output
+```
+
+输出：
+
+```text
+D:/ab1_output/
+  A.ab1
+  batch1/
+    B.ab1
+  batch2/sub/
+    C.ab1
+```
+
+即：
+
+- 文件名保持不变
+- 原相对子目录结构保持不变
+- 原始 AB1 不会覆盖
+- 支持 Windows 绝对路径、相对路径
+- 不指定 `--trimmed-ab1-dir` 时，默认输出到输入目录下的 `predicted_trimmed/`
