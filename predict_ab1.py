@@ -204,22 +204,7 @@ def main():
         try:
             result = predict_one(model, device, source_path)
 
-            print(
-                f"[{index}/{len(ab1_files)}] "
-                f"file={source_path} "
-                f"bases={result['bases']} "
-                f"start={result['start']} "
-                f"end={result['end']} "
-                f"kept_bases={result['kept_bases']} "
-                f"boundary_fallback={result['boundary_fallback']}"
-            )
-
-            if not batch_mode:
-                print(
-                    f"trimmed_sequence="
-                    f"{result['sequence'][result['start']:result['end']]}"
-                )
-
+            written_path = None
             if output_root is not None:
                 output_path = output_path_for(
                     source_path,
@@ -234,7 +219,25 @@ def main():
                     start=result["start"],
                     end=result["end"],
                 )
-                print(f"trimmed_ab1={written_path}")
+
+            message = (
+                f"[{index}/{len(ab1_files)}] "
+                f"file={source_path} "
+                f"bases={result['bases']} "
+                f"start={result['start']} "
+                f"end={result['end']} "
+                f"kept_bases={result['kept_bases']} "
+                f"boundary_fallback={result['boundary_fallback']}"
+            )
+            if written_path is not None:
+                message += f" trimmed_ab1={written_path}"
+            print(message)
+
+            if not batch_mode:
+                print(
+                    f"trimmed_sequence="
+                    f"{result['sequence'][result['start']:result['end']]}"
+                )
 
             success += 1
 
