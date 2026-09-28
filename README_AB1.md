@@ -219,3 +219,63 @@ kept_bases=...
 boundary_fallback=False
 trimmed_sequence=...
 ```
+
+
+## 可选输出裁剪后的 AB1
+
+默认情况下，预测只输出 `start/end` 和裁剪后的序列，不写新的 AB1 文件。
+
+如需生成裁剪后的 AB1：
+
+```powershell
+python predict_ab1.py `
+  --ab1 data/raw/sample001.ab1 `
+  --model logs_ab1_resnet50_enhanced/best.pth `
+  --device cpu `
+  --save-trimmed-ab1
+```
+
+默认输出到输入文件所在目录下的：
+
+```text
+predicted_trimmed/
+```
+
+并且保持原文件名不变，例如：
+
+```text
+输入：
+data/raw/sample001.ab1
+
+输出：
+data/raw/predicted_trimmed/sample001.ab1
+```
+
+不会覆盖原始 AB1。
+
+也可以指定输出目录：
+
+```powershell
+python predict_ab1.py `
+  --ab1 data/raw/sample001.ab1 `
+  --model logs_ab1_resnet50_enhanced/best.pth `
+  --device cpu `
+  --save-trimmed-ab1 `
+  --trimmed-ab1-dir data/trimmed_predicted
+```
+
+这时输出：
+
+```text
+data/trimmed_predicted/sample001.ab1
+```
+
+生成的 AB1 会同步裁剪并重建：
+
+- DATA9..DATA12 四通道峰图
+- PBAS1/PBAS2 base calls
+- PLOC1/PLOC2 peak positions
+- PCON1/PCON2 quality
+- FWO_1 channel order
+
+peak positions 会按新的 trace 起点重新定位。
