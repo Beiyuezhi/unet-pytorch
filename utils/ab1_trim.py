@@ -120,11 +120,14 @@ def _build_items(
     items.append((b"PLOC", 2, ELEM_SHORT, 2, len(peaks), peaks.tobytes()))
 
     quality_bytes = bytes(max(0, min(int(q), 255)) for q in qualities)
+    # Biopython AbiIO expects PCON2 to be a CHAR payload and decodes it.
+    # Writing it as ABIF BYTE makes AbiIO return a tuple, which then fails
+    # with: 'tuple' object has no attribute 'decode'.
     items.append(
-        (b"PCON", 1, ELEM_BYTE, 1, len(quality_bytes), quality_bytes)
+        (b"PCON", 1, ELEM_CHAR, 1, len(quality_bytes), quality_bytes)
     )
     items.append(
-        (b"PCON", 2, ELEM_BYTE, 1, len(quality_bytes), quality_bytes)
+        (b"PCON", 2, ELEM_CHAR, 1, len(quality_bytes), quality_bytes)
     )
 
     sample = _pascal_string(sample_name)
@@ -279,15 +282,23 @@ def write_trimmed_ab1(
         qualities=trimmed_qualities,
         sample_name=f"{_sample_name(record, str(source))}_trimmed",
     )
-    _write_abif(output_path, items)
+    output = Path(output_path)
+    try:
+        _write_abif(str(output), items)
 
-    # Parse our own output immediately. If the generated AB1 is malformed,
-    # fail here instead of silently returning a broken chromatogram.
-    written = SeqIO.read(str(output_path), "abi")
-    if len(written) != len(trimmed_sequence):
-        raise RuntimeError(
-            f"Trimmed AB1 validation failed: expected {len(trimmed_sequence)} "
-            f"bases, parsed {len(written)}"
-        )
+        # Parse our own output immediately. If the generated AB1 is malformed,
+        # remove the partial output instead of leaving a broken chromatogram.
+        written = SeqIO.read(str(output), "abi")
+        if len(written) != len(trimmed_sequence):
+            raise RuntimeError(
+                f"Trimmed AB1 validation failed: expected {len(trimmed_sequence)} "
+                f"bases, parsed {len(written)}"
+            )
+    except Exception:
+        try:
+            output.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
-    return str(Path(output_path))
+    return str(output)
