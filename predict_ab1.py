@@ -1,10 +1,12 @@
 import argparse
+from pathlib import Path
 
 import torch
 
 from nets.unet_resnet_1d import ResNet50UNet1D, ResNet101UNet1D
 from train_ab1 import interval_from_model_outputs
 from utils.ab1_features import load_ab1_base_features
+from utils.ab1_trim import write_trimmed_ab1
 
 
 def build_model(backbone, input_channels=9):
@@ -19,6 +21,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ab1", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--save-trimmed-ab1",
+        action="store_true",
+        help="Write the predicted interval as a new AB1 file. Disabled by default.",
+    )
+    parser.add_argument(
+        "--trimmed-ab1-dir",
+        default=None,
+        help=(
+            "Directory for trimmed AB1 output. "
+            "Default: <input_dir>/predicted_trimmed"
+        ),
+    )
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
@@ -68,6 +83,24 @@ def main():
     print(f"kept_bases={max(0, end - start)}")
     print(f"boundary_fallback={used_fallback}")
     print(f"trimmed_sequence={sequence[start:end]}")
+
+    if args.save_trimmed_ab1:
+        source_path = Path(args.ab1)
+        if args.trimmed_ab1_dir:
+            output_dir = Path(args.trimmed_ab1_dir)
+        else:
+            output_dir = source_path.parent / "predicted_trimmed"
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / source_path.name
+
+        written_path = write_trimmed_ab1(
+            source_path=str(source_path),
+            output_path=str(output_path),
+            start=start,
+            end=end,
+        )
+        print(f"trimmed_ab1={written_path}")
 
 
 if __name__ == "__main__":
